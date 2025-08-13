@@ -1,0 +1,6 @@
+@FifaWorldCupBetting.Api_HostAddress = http://localhost:5282
+
+GET {{FifaWorldCupBetting.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: fifa-betting-postgres
+    environment:
+      POSTGRES_DB: FifaWorldCupBetting
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - fifa-network
+
+  api:
+    build:
+      context: .
+      dockerfile: FifaWorldCupBetting.Api/Dockerfile
+    container_name: fifa-betting-api
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__DefaultConnection=Host=postgres;Database=FifaWorldCupBetting;Username=postgres;Password=postgres
+    ports:
+      - "5000:8080"
+    depends_on:
+      - postgres
+    networks:
+      - fifa-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: fifa-betting-frontend
+    ports:
+      - "4200:80"
+    depends_on:
+      - api
+    networks:
+      - fifa-network
+
+volumes:
+  postgres_data:
+
+networks:
+  fifa-network:
+    driver: bridge

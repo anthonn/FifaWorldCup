@@ -1,0 +1,210 @@
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.Extensions.Logging;
+using FifaWorldCupBetting.Application.DTOs.Auth;
+using FifaWorldCupBetting.Application.DTOs.User;
+using FifaWorldCupBetting.Application.Interfaces;
+using FifaWorldCupBetting.Domain.Entities;
+using BCrypt.Net;
+
+namespace FifaWorldCupBetting.Application.Services;
+
+public class AuthService : IAuthService
+{
+    private readonly IUserRepository _userRepository;
+    private readonly IJwtTokenService _jwtTokenService;
+    private readonly IEmailService _emailService;
+    private readonly ILogger<AuthService> _logger;
+
+    public AuthService(
+        IUserRepository userRepository,
+        IJwtTokenService jwtTokenService,
+        IEmailService emailService,
+        ILogger<AuthService> logger)
+    {
+        _userRepository = userRepository;
+        _jwtTokenService = jwtTokenService;
+        _emailService = emailService;
+        _logger = logger;
+    }
+
+    public async Task<LoginResponseDto> LoginAsync(LoginRequestDto loginRequest)
+    {
+        var user = await _userRepository.GetByEmailAsync(loginRequest.Email);
+        if (user == null)
+        {
+            _logger.LogWarning("Login attempt with non-existent email: {Email}", loginRequest.Email);
+            throw new UnauthorizedAccessException("Invalid email or password");
+        }
+
+        if (!user.IsActive)
+        {
+            _logger.LogWarning("Login attempt for inactive user: {Email}", loginRequest.Email);
+            throw new UnauthorizedAccessException("Account is deactivated");
+        }
+
+        if (!BCrypt.Net.BCrypt.Verify(loginRequest.Password, user.PasswordHash))
+        {
+            _logger.LogWarning("Invalid password attempt for user: {Email}", loginRequest.Email);
+            throw new UnauthorizedAccessException("Invalid email or password");
+        }
+
+        var token = _jwtTokenService.GenerateToken(user.Id, user.Email, user.Username);
+        
+        _logger.LogInformation("User logged in successfully: {Email}", user.Email);
+
+        return new LoginResponseDto
+        {
+            Token = token,
+            Username = user.Username,
+            Email = user.Email,
+            ExpiresAt = DateTime.UtcNow.AddMinutes(60) // Should match JWT expiration
+        };
+    }
+
+    public async Task<UserDto> RegisterAsync(RegisterRequestDto registerRequest)
+    {
+        // Check if email already exists
+        if (await _userRepository.EmailExistsAsync(registerRequest.Email))
+        {
+            throw new ArgumentException("Email already exists");
+        }
+
+        // Check if username already exists
+        if (await _userRepository.UsernameExistsAsync(registerRequest.Username))
+        {
+            throw new ArgumentException("Username already exists");
+        }
+
+        // Hash password
+        var passwordHash = BCrypt.Net.BCrypt.HashPassword(registerRequest.Password);
+
+        var user = new User
+        {
+            Username = registerRequest.Username,
+            Email = registerRequest.Email,
+            PasswordHash = passwordHash,
+            CreatedAt = DateTime.UtcNow,
+            IsActive = true
+        };
+
+        var createdUser = await _userRepository.CreateAsync(user);
+
+        // Send welcome email
+        try
+        {
+            await _emailService.SendWelcomeEmailAsync(createdUser.Email, createdUser.Username);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send welcome email to {Email}", createdUser.Email);
+            // Don't fail registration if email fails
+        }
+
+        _logger.LogInformation("User registered successfully: {Email}", createdUser.Email);
+
+        return new UserDto
+        {
+            Id = createdUser.Id,
+            Username = createdUser.Username,
+            Email = createdUser.Email,
+            CreatedAt = createdUser.CreatedAt,
+            IsActive = createdUser.IsActive
+        };
+    }
+
+    public async Task<bool> RequestPasswordResetAsync(ForgotPasswordRequestDto request)
+    {
+        var user = await _userRepository.GetByEmailAsync(request.Email);
+        if (user == null)
+        {
+            // Don't reveal that email doesn't exist, but log it
+            _logger.LogWarning("Password reset requested for non-existent email: {Email}", request.Email);
+            return true; // Return true to prevent email enumeration
+        }
+
+        if (!user.IsActive)
+        {
+            _logger.LogWarning("Password reset requested for inactive user: {Email}", request.Email);
+            return true; // Return true to prevent email enumeration
+        }
+
+        // Generate secure reset token
+        var resetToken = GenerateSecureToken();
+        user.PasswordResetToken = resetToken;
+        user.PasswordResetTokenExpires = DateTime.UtcNow.AddHours(1); // Token expires in 1 hour
+
+        await _userRepository.UpdateAsync(user);
+
+        // Send password reset email
+        try
+        {
+            await _emailService.SendPasswordResetEmailAsync(user.Email, resetToken, user.Username);
+            _logger.LogInformation("Password reset email sent to {Email}", user.Email);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send password reset email to {Email}", user.Email);
+            throw new InvalidOperationException("Failed to send password reset email");
+        }
+
+        return true;
+    }
+
+    public async Task<bool> ResetPasswordAsync(ResetPasswordRequestDto request)
+    {
+        var user = await _userRepository.GetByEmailAsync(request.Email);
+        if (user == null)
+        {
+            throw new ArgumentException("Invalid reset request");
+        }
+
+        if (user.PasswordResetToken != request.Token)
+        {
+            throw new ArgumentException("Invalid reset token");
+        }
+
+        if (user.PasswordResetTokenExpires == null || user.PasswordResetTokenExpires < DateTime.UtcNow)
+        {
+            throw new ArgumentException("Reset token has expired");
+        }
+
+        // Hash new password
+        user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.NewPassword);
+        user.PasswordResetToken = null;
+        user.PasswordResetTokenExpires = null;
+        user.UpdatedAt = DateTime.UtcNow;
+
+        await _userRepository.UpdateAsync(user);
+
+        _logger.LogInformation("Password reset successfully for user: {Email}", user.Email);
+
+        return true;
+    }
+
+    public async Task<UserDto?> GetCurrentUserAsync(int userId)
+    {
+        var user = await _userRepository.GetByIdAsync(userId);
+        if (user == null || !user.IsActive)
+        {
+            return null;
+        }
+
+        return new UserDto
+        {
+            Id = user.Id,
+            Username = user.Username,
+            Email = user.Email,
+            CreatedAt = user.CreatedAt,
+            IsActive = user.IsActive
+        };
+    }
+
+    private static string GenerateSecureToken()
+    {
+        using var rng = RandomNumberGenerator.Create();
+        var bytes = new byte[32];
+        rng.GetBytes(bytes);
+        return Convert.ToBase64String(bytes).Replace("+", "-").Replace("/", "_").Replace("=", "");
+    }
+}
